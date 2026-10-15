@@ -140,13 +140,19 @@ class DangerConfig:
     danger_penalty_weight: float = -0.05
     # 洞口中心核心腔体半宽 (像素)
     cavity_half_size: int = 20
-    # 洞口匹配阈值
-    hole_match_threshold: float = 0.70
+    # 洞口绝对匹配基础阈值
+    hole_match_threshold: float = 0.75
+    # 多洞口锚定时相对峰值的最大容忍下降差值 (防止单轨关卡杂质纹理误识别)
+    hole_match_relative_drop: float = 0.08
+    # 关卡最大支持洞口数 (单轨 1, 双轨 2, 可扩展)
+    max_holes: int = 2
 
 @dataclass
 class StartGateConfig:
     # 图2“剩余X次机会”屏幕中央检测区域 (ymin, xmin, ymax, xmax)
     lives_banner_roi: Tuple[int, int, int, int] = (160, 100, 280, 540)
+    # 图2橙黄色大字横幅最小黄色像素命中阈值 (真实横幅约9000+, 正常局黄球<=3100)
+    lives_banner_pixel_threshold: int = 5500
     # 高速冲球阶段平均灰度绝对帧差阈值 (判定冲球中)
     rush_motion_threshold: float = 12.0
     # 刹停定格平稳阶段帧差上限 (判定定格刹停)

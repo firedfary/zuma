@@ -125,7 +125,7 @@ class ZumaStateMachine:
         frame: np.ndarray,
         threshold: Optional[float] = None,
         min_distance: int = 50,
-        max_holes: int = 2,
+        max_holes: Optional[int] = None,
     ) -> List[Tuple[int, int]]:
         """
         Locate all skull hole centers in the frame using template matching and NMS.
@@ -151,9 +151,10 @@ class ZumaStateMachine:
         if max_val < 0.50:
             return self.hole_locations
 
-        # Adaptive threshold: within 0.12 of top peak, and at least base threshold
         base_th = threshold if threshold is not None else self.danger_config.hole_match_threshold
-        th_val = max(base_th, max_val - 0.12)
+        rel_drop = self.danger_config.hole_match_relative_drop
+        th_val = max(base_th, max_val - rel_drop)
+        limit_holes = max_holes if max_holes is not None else self.danger_config.max_holes
 
         # Find candidates exceeding threshold
         y_locs, x_locs = np.where(res >= th_val)
@@ -175,7 +176,7 @@ class ZumaStateMachine:
                     break
             if not too_close:
                 picked_centers.append((cx, cy))
-                if len(picked_centers) >= max_holes:
+                if len(picked_centers) >= limit_holes:
                     break
 
         # Fallback if no candidate met threshold: try top peak if >= 0.50
@@ -238,7 +239,7 @@ class ZumaStateMachine:
         hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV) if crop.ndim == 3 else crop
         mask = cv2.inRange(hsv, np.array([12, 120, 160]), np.array([32, 255, 255]))
         yellow_count = int(np.sum(mask > 0))
-        return yellow_count > 1800
+        return yellow_count > self.start_gate_config.lives_banner_pixel_threshold
 
     def check_frog_mouth_has_ball(
         self,
@@ -267,6 +268,9 @@ class ZumaStateMachine:
     def check_ball_in_hole(self, hole_roi: np.ndarray) -> bool:
         """
         Detect if a colored ball has entered the skull hole cavity.
+        Discriminates against the closed golden skull teeth by checking:
+        1. Non-golden ball colors (blue, green, red, purple) inside cavity (> 50 px).
+        2. High saturation/brightness yellow ball when cavity is open (dark_ratio > 0.25 and yellow_px > 300).
         """
         if hole_roi is None or hole_roi.size == 0:
             return False
@@ -280,9 +284,22 @@ class ZumaStateMachine:
         else:
             cavity = hole_roi
 
+        gray = cv2.cvtColor(cavity, cv2.COLOR_BGR2GRAY) if cavity.ndim == 3 else cavity
         hsv = cv2.cvtColor(cavity, cv2.COLOR_BGR2HSV) if cavity.ndim == 3 else cavity
-        ball_pixels = int(np.sum((hsv[:, :, 1] > 100) & (hsv[:, :, 2] > 70)))
-        return ball_pixels > 250
+        dark_ratio = float(np.mean(gray < 35))
+
+        # Check for non-skull ball colors:
+        # Blue/Green/Purple/Red balls
+        other_ball_pixels = int(np.sum(
+            ((hsv[:, :, 0] >= 40) & (hsv[:, :, 0] <= 165) & (hsv[:, :, 1] > 80) & (hsv[:, :, 2] > 50)) |
+            (((hsv[:, :, 0] <= 10) | (hsv[:, :, 0] >= 170)) & (hsv[:, :, 1] > 80) & (hsv[:, :, 2] > 50))
+        ))
+        # Yellow ball: bright saturated yellow inside open cavity
+        yellow_ball_pixels = int(np.sum(
+            (hsv[:, :, 0] >= 15) & (hsv[:, :, 0] <= 38) & (hsv[:, :, 1] > 100) & (hsv[:, :, 2] > 140)
+        ))
+
+        return (other_ball_pixels > 50) or (dark_ratio > 0.25 and yellow_ball_pixels > 300)
 
     def wait_for_round_ready(
         self,
@@ -460,6 +477,17 @@ class ZumaStateMachine:
             info["max_openness"] = max_openness
             info["hole_openness_list"] = openness_list
 
+            # Check fatal ball in hole first: an entered ball is absolute proof of death
+            has_ball_in_hole = any(self.check_ball_in_hole(roi) for roi in hole_rois)
+            frog_has_ball = self.check_frog_mouth_has_ball(frame_rgb)
+
+            if has_ball_in_hole:
+                self.is_emergency = True
+                info["is_emergency"] = True
+                info["max_openness"] = 1.0
+                self.current_state = GameState.DYING_HOLE
+                return GameState.DYING_HOLE, info
+
             # Hysteresis loop
             if max_openness >= self.danger_config.openness_emergency_threshold:
                 self.is_emergency = True
@@ -469,11 +497,9 @@ class ZumaStateMachine:
             info["is_emergency"] = self.is_emergency
 
             if self.is_emergency:
-                # Double-check fatal drain: ball in any hole or frog mouth lost ball
-                has_ball_in_hole = any(self.check_ball_in_hole(roi) for roi in hole_rois)
-                frog_has_ball = self.check_frog_mouth_has_ball(frame_rgb)
-                if has_ball_in_hole or not frog_has_ball:
+                if not frog_has_ball:
                     self.current_state = GameState.DYING_HOLE
+                    info["max_openness"] = 1.0
                     return GameState.DYING_HOLE, info
                 self.current_state = GameState.EMERGENCY
                 return GameState.EMERGENCY, info

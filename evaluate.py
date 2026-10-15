@@ -48,7 +48,7 @@ def evaluate(checkpoint_path: str, num_episodes: int = 5, device: str = "cuda"):
             steps += 1
 
             danger_str = step_info.get("danger_str", f"Danger: {int(step_info.get('openness', 0.0) * 100)}%")
-            if steps % 10 == 0 or step_info.get("openness", 0.0) >= 0.70:
+            if steps % 10 == 0 or step_info.get("openness", 0.0) >= 0.70 or done:
                 print(f"[eval] Step {steps} | {danger_str} | Score: {step_info.get('score', 0)}")
 
         final_danger = step_info.get("danger_str", f"Danger: {int(step_info.get('openness', 0.0) * 100)}%")

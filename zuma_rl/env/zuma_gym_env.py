@@ -116,12 +116,6 @@ class ZumaGymEnv(gym.Env):
             print(f"[env] State is {state.name}, executing auto-reset...")
             self.state_machine.handle_reset_step(max_wait_sec=10.0)
 
-        # Dynamic hole anchoring
-        frame = self.capture.capture_frame()
-        if frame is not None:
-            self.hole_locations = self.state_machine.anchor_hole_locations(frame)
-            print(f"[env] Anchored {len(self.hole_locations)} hole location(s): {self.hole_locations}")
-
         # Wait for round ready composite gating (lives banner -> rush motion -> calm -> frog ready)
         self.state_machine.wait_for_round_ready(self.capture)
 
@@ -130,6 +124,10 @@ class ZumaGymEnv(gym.Env):
         frame = self.capture.capture_frame()
         if frame is None:
             frame = np.zeros((self.w_config.expected_client_height, self.w_config.expected_client_width, 3), dtype=np.uint8)
+
+        # Dynamic hole anchoring on clean, settled game frame
+        self.hole_locations = self.state_machine.anchor_hole_locations(frame)
+        print(f"[env] Anchored {len(self.hole_locations)} hole location(s): {self.hole_locations}")
 
         self.current_score = self.digit_reader.extract_score(frame, roi=self.e_config.score_roi)
         self.prev_score = self.current_score
