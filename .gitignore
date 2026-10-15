@@ -1,0 +1,58 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Cpython / cache
+*.pyc
+
+# PyTorch checkpoints and large model binaries
+checkpoints/*.pt
+*.pt
+*.pth
+test_ckpt.pt
+
+# Proprietary Game Client and assets (Zuma Deluxe)
+祖玛豪华版/
+Zuma/
+Zuma_Deluxe/
+*.exe
+*.dll
+*.mo3
+*.ogg
+*.wav
+*.dat
+
+# Distribution / packaging
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+/.env/
+/.venv/
+/env/
+/venv/
+/ENV/
+
+# IDEs
+.vscode/
+.idea/
+
+# Windows system files
+Thumbs.db
+ehthumbs.db
+Desktop.ini
