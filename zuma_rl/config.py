@@ -127,9 +127,69 @@ class TrainConfig:
     max_train_steps: int = 100000
 
 @dataclass
+class DangerConfig:
+    # 洞口匹配模板文件名
+    hole_template_name: str = "Hole.gif"
+    # 洞口掩膜文件名
+    hole_mask_name: str = "_Hole.gif"
+    # 骷髅完全张开进入紧急状态阈值 (图5)
+    openness_emergency_threshold: float = 0.85
+    # 翻盘消除后骷髅重新闭合解除紧急状态阈值 (图3/4)
+    openness_recovery_threshold: float = 0.70
+    # 危险度密集塑形惩罚权重 (0.0 表示关闭)
+    danger_penalty_weight: float = -0.05
+    # 洞口中心核心腔体半宽 (像素)
+    cavity_half_size: int = 20
+    # 洞口匹配阈值
+    hole_match_threshold: float = 0.70
+
+@dataclass
+class StartGateConfig:
+    # 图2“剩余X次机会”屏幕中央检测区域 (ymin, xmin, ymax, xmax)
+    lives_banner_roi: Tuple[int, int, int, int] = (160, 100, 280, 540)
+    # 高速冲球阶段平均灰度绝对帧差阈值 (判定冲球中)
+    rush_motion_threshold: float = 12.0
+    # 刹停定格平稳阶段帧差上限 (判定定格刹停)
+    calm_motion_threshold: float = 3.0
+    # 判定刹停所需连续维持平稳的采样帧数
+    calm_required_consecutive_frames: int = 3
+    # 刹停后等待青蛙装填就位的安全防抖延时 (秒)
+    settling_safety_delay_sec: float = 0.20
+    # 最大等待开局超时 (秒)
+    max_wait_ready_sec: float = 12.0
+
+def detect_game_dir(explicit_path: Optional[str] = None) -> str:
+    """
+    Intelligently find the Zuma game directory containing images_chs and fonts.
+    Supports both '祖玛' and '祖玛豪华版' paths across workspace and drives.
+    """
+    if explicit_path and os.path.isdir(explicit_path) and os.path.isdir(os.path.join(explicit_path, "images_chs")):
+        return explicit_path
+    
+    candidates = [
+        r"d:\zuma\祖玛豪华版",
+        r"d:\zuma\祖玛",
+        os.path.join(os.getcwd(), "祖玛豪华版"),
+        os.path.join(os.getcwd(), "祖玛"),
+        os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "祖玛豪华版"),
+        os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "祖玛"),
+    ]
+    for c in candidates:
+        if os.path.isdir(c) and os.path.isdir(os.path.join(c, "images_chs")):
+            return c
+            
+    # Fallback to default
+    return r"d:\zuma\祖玛豪华版"
+
+@dataclass
 class ZumaConfig:
     window: WindowConfig = field(default_factory=WindowConfig)
     env: EnvConfig = field(default_factory=EnvConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
-    game_dir: str = r"d:\zuma\祖玛豪华版"
+    danger: DangerConfig = field(default_factory=DangerConfig)
+    start_gate: StartGateConfig = field(default_factory=StartGateConfig)
+    game_dir: str = field(default_factory=detect_game_dir)
+
+    def __post_init__(self):
+        self.game_dir = detect_game_dir(self.game_dir)

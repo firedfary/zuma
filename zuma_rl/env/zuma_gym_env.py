@@ -42,8 +42,12 @@ class ZumaGymEnv(gym.Env):
         self.state_machine = ZumaStateMachine(
             game_dir=self.config.game_dir,
             capture=self.capture,
-            controller=self.controller
+            controller=self.controller,
+            danger_config=self.config.danger,
+            start_gate_config=self.config.start_gate,
         )
+        self.hole_locations = []
+        self.current_openness = 0.0
 
         # Gymnasium spaces
         self.action_space = spaces.Discrete(self.e_config.total_actions)
@@ -112,14 +116,24 @@ class ZumaGymEnv(gym.Env):
             print(f"[env] State is {state.name}, executing auto-reset...")
             self.state_machine.handle_reset_step(max_wait_sec=10.0)
 
-        # Initial frame capture and score reading
-        time.sleep(0.1)
+        # Dynamic hole anchoring
+        frame = self.capture.capture_frame()
+        if frame is not None:
+            self.hole_locations = self.state_machine.anchor_hole_locations(frame)
+            print(f"[env] Anchored {len(self.hole_locations)} hole location(s): {self.hole_locations}")
+
+        # Wait for round ready composite gating (lives banner -> rush motion -> calm -> frog ready)
+        self.state_machine.wait_for_round_ready(self.capture)
+
+        # Initial frame capture after settling and score reading
+        time.sleep(0.05)
         frame = self.capture.capture_frame()
         if frame is None:
             frame = np.zeros((self.w_config.expected_client_height, self.w_config.expected_client_width, 3), dtype=np.uint8)
 
         self.current_score = self.digit_reader.extract_score(frame, roi=self.e_config.score_roi)
         self.prev_score = self.current_score
+        self.current_openness = 0.0
 
         processed = self._process_frame(frame)
         for _ in range(self.e_config.num_stack_frames):
@@ -130,7 +144,11 @@ class ZumaGymEnv(gym.Env):
 
         info = {
             "initial_score": self.current_score,
-            "state": self.state_machine.current_state.name
+            "state": self.state_machine.current_state.name,
+            "hole_locations": self.hole_locations,
+            "openness": 0.0,
+            "danger_pct": 0,
+            "danger_str": "Danger: 0%",
         }
         return obs, info
 
@@ -140,7 +158,7 @@ class ZumaGymEnv(gym.Env):
         1. Action execution
         2. Wait to satisfy 100ms step duration
         3. Capture new frame and parse score
-        4. State detection (check game over)
+        4. State detection (check game over & danger)
         5. Composite reward shaping
         """
         self.episode_steps += 1
@@ -149,6 +167,24 @@ class ZumaGymEnv(gym.Env):
         if self.controller.is_emergency_stopped():
             obs = self._get_stacked_obs()
             return obs, 0.0, True, True, {"emergency_stopped": True}
+
+        # If already dying or terminated, immediately return without executing action (physical input block)
+        if self.state_machine.current_state == GameState.DYING_HOLE:
+            obs = self._get_stacked_obs()
+            info = {
+                "score": self.current_score,
+                "delta_score": 0,
+                "episode_score_gain": self.episode_score_gain,
+                "episode_steps": self.episode_steps,
+                "action_type": "blocked",
+                "action_coords": (0, 0),
+                "state": GameState.DYING_HOLE.name,
+                "openness": self.current_openness,
+                "danger_pct": int(self.current_openness * 100),
+                "danger_str": f"Danger: {int(self.current_openness * 100)}%",
+                "hole_locations": self.hole_locations,
+            }
+            return obs, float(self.e_config.death_penalty), True, False, info
 
         # 1. Execute action
         act_type, act_coords = self.controller.execute_action(action)
@@ -178,7 +214,7 @@ class ZumaGymEnv(gym.Env):
         self.current_score = new_score
         self.episode_score_gain += delta_score
 
-        # 5. State detection (Game Over check)
+        # 5. State detection (Game Over & Danger check)
         state, state_info = self.state_machine.detect_state(raw_frame)
         if state == GameState.PAUSED:
             # Auto unpause if paused
@@ -189,7 +225,17 @@ class ZumaGymEnv(gym.Env):
                 raw_frame = new_f
             state, state_info = self.state_machine.detect_state(raw_frame)
 
-        is_game_over = (state == GameState.GAME_OVER) or (state == GameState.SETTLEMENT) or (state == GameState.SURVIVAL_MENU)
+        self.current_openness = state_info.get("max_openness", 0.0)
+        is_dying = (state == GameState.DYING_HOLE)
+        is_game_over = (
+            (state == GameState.GAME_OVER)
+            or (state == GameState.SETTLEMENT)
+            or (state == GameState.SURVIVAL_MENU)
+            or is_dying
+        )
+
+        if is_dying:
+            print(f"[env] Ball entered hole / fatal drain detected (Danger: {int(self.current_openness * 100)}%), terminating episode...")
 
         # 6. Composite reward shaping
         reward = 0.0
@@ -200,6 +246,10 @@ class ZumaGymEnv(gym.Env):
         
         # Step penalty
         reward += self.e_config.step_penalty
+
+        # Dense Danger penalty shaping: R_danger = w_danger * S_open
+        danger_penalty = self.config.danger.danger_penalty_weight * self.current_openness
+        reward += danger_penalty
 
         # Empty shot penalty
         if act_type == "click" and delta_score == 0:
@@ -223,7 +273,12 @@ class ZumaGymEnv(gym.Env):
             "episode_steps": self.episode_steps,
             "action_type": act_type,
             "action_coords": act_coords,
-            "state": state.name
+            "state": state.name,
+            "openness": self.current_openness,
+            "danger_pct": int(self.current_openness * 100),
+            "danger_str": f"Danger: {int(self.current_openness * 100)}%",
+            "danger_penalty": danger_penalty,
+            "hole_locations": self.hole_locations,
         }
 
         return obs, float(reward), terminated, truncated, info

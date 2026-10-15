@@ -4,6 +4,7 @@ import time
 import threading
 import torch
 import numpy as np
+import cv2
 
 from zuma_rl.config import ZumaConfig, WindowConfig, EnvConfig, ModelConfig, TrainConfig
 from zuma_rl.model.spatial_fcn_dqn import SpatialFCNDQN
@@ -342,6 +343,241 @@ class TestZumaRLSuite(unittest.TestCase):
             self.assertIsNotNone(frame)
             self.assertEqual(frame.shape, (480, 640, 3))
             self.assertGreater(frame.mean(), 1.0)
+
+    def test_11_hole_openness_progression(self):
+        """Test skull mouth openness progression is strictly monotonic: Fig 1 <= 0.10, Fig 5 >= 0.85"""
+        sm = ZumaStateMachine(
+            game_dir=self.config.game_dir,
+            danger_config=self.config.danger,
+            start_gate_config=self.config.start_gate
+        )
+        user_p = r"C:/Users/fired/.gemini/antigravity/brain/fa5a9161-23ff-46ba-9697-6cec10ef368c/.user_uploaded"
+        fig_files = [
+            "media_1792076465643_559df118.jpg",  # Fig 1: closed
+            "media_1792076480168_aacca3ee.jpg",  # Fig 2: opening
+            "media_1792076492170_757bb65d.jpg",  # Fig 3: opening further
+            "media_1792076500374_8083b2ca.jpg",  # Fig 4: opening more
+            "media_1792076555026_364c2a5f.jpg",  # Fig 5: fully open
+        ]
+        if os.path.exists(user_p) and all(os.path.exists(os.path.join(user_p, f)) for f in fig_files):
+            openness_vals = []
+            for fn in fig_files:
+                raw = np.fromfile(os.path.join(user_p, fn), dtype=np.uint8)
+                img = cv2.imdecode(raw, cv2.IMREAD_COLOR)
+                f640 = cv2.resize(img[39:39+720, 2:2+960], (640, 480))
+                roi = f640[216-44:216+44, 211-44:211+44]
+                val = sm.compute_skull_openness(roi)
+                openness_vals.append(val)
+
+            # Assert Fig 1 is <= 0.10
+            self.assertLessEqual(openness_vals[0], 0.10, f"Fig 1 expected <= 0.10, got {openness_vals[0]}")
+            # Assert Fig 5 is >= 0.85
+            self.assertGreaterEqual(openness_vals[-1], 0.85, f"Fig 5 expected >= 0.85, got {openness_vals[-1]}")
+            # Assert strictly monotonic progression
+            for i in range(len(openness_vals) - 1):
+                self.assertLess(
+                    openness_vals[i],
+                    openness_vals[i+1],
+                    f"Progression not monotonic: Fig {i+1} ({openness_vals[i]}) >= Fig {i+2} ({openness_vals[i+1]})"
+                )
+
+        # Synthetic cavity verification to ensure unit test coverage in any environment
+        synthetic_ratios = [0.0, 0.10, 0.25, 0.50, 0.95]
+        synthetic_vals = []
+        for r in synthetic_ratios:
+            cavity = np.ones((40, 40, 3), dtype=np.uint8) * 100
+            dark_pixels = int(40 * 40 * r)
+            cavity.reshape(-1, 3)[:dark_pixels] = 10
+            val = sm.compute_skull_openness(cavity)
+            synthetic_vals.append(val)
+
+        self.assertLessEqual(synthetic_vals[0], 0.05)
+        self.assertGreaterEqual(synthetic_vals[-1], 0.85)
+        for i in range(len(synthetic_vals) - 1):
+            self.assertLess(synthetic_vals[i], synthetic_vals[i+1])
+
+    def test_12_lives_banner_detection(self):
+        """Test lives banner ('剩余 X 次机会') is accurately detected without false positives on normal game"""
+        sm = ZumaStateMachine(
+            game_dir=self.config.game_dir,
+            danger_config=self.config.danger,
+            start_gate_config=self.config.start_gate
+        )
+        user_p = r"C:/Users/fired/.gemini/antigravity/brain/fa5a9161-23ff-46ba-9697-6cec10ef368c/.user_uploaded"
+        banner_file = os.path.join(user_p, "media_1792075117894_a12e8f12.jpg")
+        normal_file = os.path.join(user_p, "media_1792076465643_559df118.jpg")
+
+        if os.path.exists(banner_file) and os.path.exists(normal_file):
+            raw_b = np.fromfile(banner_file, dtype=np.uint8)
+            img_b = cv2.imdecode(raw_b, cv2.IMREAD_COLOR)
+            f640_b = cv2.resize(img_b[39:39+720, 2:2+960], (640, 480))
+            self.assertTrue(sm.check_lives_banner(f640_b), "Failed to detect lives banner in Problem 2 image")
+
+            raw_n = np.fromfile(normal_file, dtype=np.uint8)
+            img_n = cv2.imdecode(raw_n, cv2.IMREAD_COLOR)
+            f640_n = cv2.resize(img_n[39:39+720, 2:2+960], (640, 480))
+            self.assertFalse(sm.check_lives_banner(f640_n), "False positive lives banner on normal gameplay frame")
+
+        # Synthetic banner and clear screen
+        canvas_banner = np.zeros((480, 640, 3), dtype=np.uint8)
+        canvas_banner[180:240, 200:440] = [30, 200, 255]
+        self.assertTrue(sm.check_lives_banner(canvas_banner))
+
+        canvas_empty = np.zeros((480, 640, 3), dtype=np.uint8)
+        self.assertFalse(sm.check_lives_banner(canvas_empty))
+
+    def test_13_motion_settling_gating(self):
+        """Test 4-step composite gating: banner clear -> motion rush -> calm settled -> ready"""
+        sm = ZumaStateMachine(
+            game_dir=self.config.game_dir,
+            danger_config=self.config.danger,
+            start_gate_config=self.config.start_gate
+        )
+
+        class MockCapture:
+            def __init__(self):
+                self.call_idx = 0
+                self.frames = []
+                # Frame 0-1: Banner present
+                f_banner = np.zeros((480, 640, 3), dtype=np.uint8)
+                f_banner[180:240, 200:440] = [30, 200, 255]
+                self.frames.extend([f_banner, f_banner])
+                
+                # Frame 2-3: Banner gone, high difference (rush motion)
+                f_rush1 = np.zeros((480, 640, 3), dtype=np.uint8)
+                f_rush2 = np.ones((480, 640, 3), dtype=np.uint8) * 30
+                self.frames.extend([f_rush1, f_rush2])
+
+                # Frame 4-7: Settled baseline (diff = 0 < 3.0) for >= 3 frames
+                f_calm = np.ones((480, 640, 3), dtype=np.uint8) * 30
+                # Frog mouth has ball
+                f_calm[233-10:233+10, 327-10:327+10] = [0, 220, 255]
+                self.frames.extend([f_calm, f_calm, f_calm, f_calm])
+
+            def capture_frame(self):
+                if self.call_idx < len(self.frames):
+                    frame = self.frames[self.call_idx]
+                    self.call_idx += 1
+                    return frame
+                return self.frames[-1]
+
+        mock_cap = MockCapture()
+        ready = sm.wait_for_round_ready(capture=mock_cap, max_wait_sec=2.0)
+        self.assertTrue(ready)
+        self.assertEqual(sm.current_state, GameState.IN_GAME)
+
+    def test_14_multi_hole_anchoring(self):
+        """Test multi-hole template matching anchoring with NMS for dual-track maps"""
+        sm = ZumaStateMachine(
+            game_dir=self.config.game_dir,
+            danger_config=self.config.danger,
+            start_gate_config=self.config.start_gate
+        )
+        self.assertIn("hole_template", sm.templates)
+        self.assertIn("hole_mask", sm.templates)
+
+        tmpl = sm.templates["hole_template"]
+        mask = sm.templates["hole_mask"]
+        th_h, th_w = tmpl.shape[:2]
+
+        canvas = np.zeros((480, 640, 3), dtype=np.uint8) + 128
+        # Place two hole locations (dual-track level)
+        loc1 = (120, 160)
+        loc2 = (420, 280)
+
+        for loc in [loc1, loc2]:
+            x, y = loc
+            for r in range(th_h):
+                for c in range(th_w):
+                    if mask[r, c] > 50:
+                        canvas[y + r, x + c] = tmpl[r, c]
+
+        anchored = sm.anchor_hole_locations(canvas, threshold=0.65)
+        self.assertEqual(len(anchored), 2, f"Expected 2 holes for dual track, found {len(anchored)}")
+        expected_centers = [(loc1[0] + th_w // 2, loc1[1] + th_h // 2), (loc2[0] + th_w // 2, loc2[1] + th_h // 2)]
+        
+        for exp in expected_centers:
+            matched = any(np.hypot(cx - exp[0], cy - exp[1]) <= 5 for cx, cy in anchored)
+            self.assertTrue(matched, f"Expected hole at {exp} not found in {anchored}")
+
+    def test_15_dying_hole_and_hysteresis(self):
+        """Test hysteresis recovery (openness < 0.70) and fatal termination (DYING_HOLE)"""
+        sm = ZumaStateMachine(
+            game_dir=self.config.game_dir,
+            danger_config=self.config.danger,
+            start_gate_config=self.config.start_gate
+        )
+        sm.hole_locations = [(200, 200)]
+
+        # 1. Test emergency triggered when openness >= 0.85
+        frame_emergency = np.zeros((480, 640, 3), dtype=np.uint8) + 100
+        # Cavity pure black
+        frame_emergency[200-20:200+20, 200-20:200+20] = 0
+        # Frog mouth has ball
+        frame_emergency[233-10:233+10, 327-10:327+10] = [0, 220, 255]
+
+        state, info = sm.detect_state(frame_emergency)
+        self.assertEqual(state, GameState.EMERGENCY)
+        self.assertTrue(sm.is_emergency)
+        self.assertGreaterEqual(info["max_openness"], 0.85)
+
+        # 2. Test hysteresis hold when openness drops to 0.75 (above 0.70 threshold)
+        frame_hold = np.zeros((480, 640, 3), dtype=np.uint8) + 100
+        frame_hold[200-20:200+20, 200-20:200+20] = 0
+        frame_hold[200-8:200+8, 200-8:200+8] = 80
+        frame_hold[233-10:233+10, 327-10:327+10] = [0, 220, 255]
+
+        state, info = sm.detect_state(frame_hold)
+        self.assertEqual(state, GameState.EMERGENCY, "Hysteresis should keep EMERGENCY while >= 0.70")
+        self.assertTrue(sm.is_emergency)
+
+        # 3. Test hysteresis recovery when openness drops < 0.70
+        frame_recovery = np.zeros((480, 640, 3), dtype=np.uint8) + 100
+        frame_recovery[200-20:200+20, 200-20:200+20] = 120
+        frame_recovery[233-10:233+10, 327-10:327+10] = [0, 220, 255]
+
+        state, info = sm.detect_state(frame_recovery)
+        self.assertEqual(state, GameState.IN_GAME, "Hysteresis should recover to IN_GAME when < 0.70")
+        self.assertFalse(sm.is_emergency)
+
+        # 4. Test fatal termination: EMERGENCY + ball in hole cavity -> DYING_HOLE
+        sm.is_emergency = True
+        frame_fatal = np.zeros((480, 640, 3), dtype=np.uint8) + 100
+        frame_fatal[200-20:200+20, 200-20:200+20] = 0
+        frame_fatal[200-12:200+12, 200-12:200+12] = [0, 240, 255]
+        frame_fatal[233-10:233+10, 327-10:327+10] = [0, 220, 255]
+
+        state, info = sm.detect_state(frame_fatal)
+        self.assertEqual(state, GameState.DYING_HOLE, "Expected DYING_HOLE when ball enters open skull")
+
+    def test_16_gym_env_danger_gating_and_termination(self):
+        """Test ZumaGymEnv integration of danger reward shaping and fatal DYING_HOLE input blocking"""
+        cfg = ZumaConfig()
+        cfg.window.auto_activate_window = False
+        env = ZumaGymEnv(config=cfg)
+
+        # 1. Verify reset provides danger info
+        obs, info = env.reset()
+        self.assertIn("openness", info)
+        self.assertIn("danger_str", info)
+        self.assertEqual(info["danger_str"], "Danger: 0%")
+
+        # 2. Verify step returns danger_str formatting (e.g. Danger: 78%)
+        env.state_machine.detect_state = lambda f: (GameState.IN_GAME, {"max_openness": 0.78})
+        # Execute no-op action (769)
+        obs, reward, terminated, truncated, step_info = env.step(769)
+        self.assertEqual(step_info["danger_str"], "Danger: 78%")
+        self.assertEqual(step_info["danger_pct"], 78)
+        self.assertAlmostEqual(step_info["danger_penalty"], cfg.danger.danger_penalty_weight * 0.78)
+
+        # 3. Verify fatal DYING_HOLE physical block
+        env.state_machine.current_state = GameState.DYING_HOLE
+        obs, reward, terminated, truncated, fatal_info = env.step(100)
+        self.assertTrue(terminated)
+        self.assertEqual(fatal_info["action_type"], "blocked")
+        self.assertEqual(reward, cfg.env.death_penalty)
+
+        env.close()
 
 if __name__ == "__main__":
     unittest.main()
