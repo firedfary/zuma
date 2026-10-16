@@ -794,5 +794,62 @@ class TestZumaRLSuite(unittest.TestCase):
         self.assertEqual(state, GameState.DYING_HOLE, "2 consecutive fast motion frames in EMERGENCY must trigger DYING_HOLE")
         self.assertEqual(info["max_openness"], 1.0)
 
+    def test_21_shooting_in_emergency_does_not_die(self):
+        """Test that firing a shot while in EMERGENCY (empty frog mouth) does NOT kill the player when no ball is in hole"""
+        sm = ZumaStateMachine(danger_config=self.config.danger)
+        sm.hole_locations = [(200, 200)]
+        sm.is_emergency = True
+        sm.smoothed_openness = 0.90
+
+        # Frame with wide open cavity, balls stationary on track, but frog mouth empty (shot in flight)
+        f = np.zeros((480, 640, 3), dtype=np.uint8) + 50
+        # Wide open cavity
+        f[200-20:200+20, 200-20:200+20] = 5
+        # Stationary balls
+        for i in range(8):
+            cv2.circle(f, (300 + i * 32, 300), 14, (0, 0, 255), -1)
+        # Frog mouth at (327, 233) has NO loaded ball (empty background)
+
+        state, info = sm.detect_state(f)
+        self.assertEqual(state, GameState.EMERGENCY, "Shooting a ball in emergency must NOT trigger DYING_HOLE!")
+        self.assertFalse(info["frog_has_ball"])
+        self.assertFalse(info["has_ball_in_hole"])
+        self.assertTrue(sm.is_emergency)
+
+    def test_22_rush_motion_at_ball_spacing_shift(self):
+        """Test that whole-chain collective rush motion is detected even at shifts matching exact ball diameter / spacing (32px)"""
+        sm = ZumaStateMachine(danger_config=self.config.danger)
+        f0 = np.zeros((480, 640, 3), dtype=np.uint8) + 60
+        balls0 = [(100 + i * 32, 200) for i in range(10)]
+        for b in balls0:
+            cv2.circle(f0, b, 14, (0, 0, 255), -1)
+
+        # Shift by exact ball spacing of 32 pixels
+        f_shift32 = np.zeros((480, 640, 3), dtype=np.uint8) + 60
+        balls_shift32 = [(x + 32, y) for x, y in balls0]
+        for b in balls_shift32:
+            cv2.circle(f_shift32, b, 14, (0, 0, 255), -1)
+
+        ratio32 = sm.compute_collective_ball_motion(f_shift32, f0, balls_shift32, balls0)
+        self.assertGreaterEqual(ratio32, self.config.danger.collective_fast_ball_ratio, "32px shift must detect collective fast motion >= 0.80")
+        self.assertEqual(ratio32, 1.0)
+
+    def test_23_rate_limiter_active_on_first_step(self):
+        """Test that rate limiter is active on step 1 of an episode after reset(), clamping sudden spikes"""
+        sm = ZumaStateMachine(danger_config=self.config.danger)
+        sm.reset()
+        sm.hole_locations = [(211, 216)]
+
+        # Frame with sudden artificial openness spike (1.0) on step 1
+        frame_spike = np.zeros((480, 640, 3), dtype=np.uint8) + 50
+        frame_spike[216-20:216+20, 211-20:211+20] = 5  # dark cavity = 1.0 openness
+        frame_spike[233-10:233+10, 327-10:327+10] = [0, 220, 255]
+
+        state, info = sm.detect_state(frame_spike)
+        self.assertAlmostEqual(info["max_openness"], sm.danger_config.max_openness_step_delta, places=2)
+        self.assertEqual(state, GameState.IN_GAME, "Step 1 spike must be clamped to safe zone (0.08 < 0.30) and stay IN_GAME")
+        self.assertFalse(sm.is_emergency)
+
 if __name__ == "__main__":
     unittest.main()
+

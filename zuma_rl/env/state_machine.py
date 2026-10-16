@@ -448,6 +448,14 @@ class ZumaStateMachine:
         speed_th = self.danger_config.fast_ball_speed_threshold
         diff_th = self.danger_config.fast_ball_diff_threshold
 
+        # Global cluster centroid shift to handle periodic chain aliasing
+        # (e.g. rush displacement matching ball diameter ~30px)
+        c_arr = np.array(curr_balls, dtype=np.float32)
+        p_arr = np.array(prev_balls, dtype=np.float32)
+        c_mean = np.mean(c_arr, axis=0)
+        p_mean = np.mean(p_arr, axis=0)
+        cluster_shift = float(np.hypot(c_mean[0] - p_mean[0], c_mean[1] - p_mean[1]))
+
         fast_count = 0
         for cx, cy in curr_balls:
             # 1. Nearest ball distance in previous frame
@@ -460,7 +468,7 @@ class ZumaStateMachine:
             p_p = g_prev[y1:y2, x1:x2].astype(np.float32)
             diff = float(np.mean(np.abs(p_c - p_p))) if p_c.size > 0 else 0.0
 
-            if d_min >= speed_th or diff >= diff_th:
+            if d_min >= speed_th or diff >= diff_th or cluster_shift >= speed_th:
                 fast_count += 1
 
         return float(fast_count / len(curr_balls))
@@ -627,7 +635,7 @@ class ZumaStateMachine:
             self.current_state = GameState.LIVES_BANNER
             return GameState.LIVES_BANNER, info
 
-        # Check external reset or state discontinuity
+        # Reset temporal tracking on external state override or terminal / menu states
         if self._last_is_emergency != self.is_emergency or self.current_state in [
             GameState.DYING_HOLE, GameState.GAME_OVER, GameState.SETTLEMENT, GameState.SURVIVAL_MENU
         ]:
@@ -674,9 +682,11 @@ class ZumaStateMachine:
             self.prev_frame = frame_rgb
             self.prev_balls = curr_balls
 
+            was_uninitialized = (self.smoothed_openness is None)
+
             # Physical rate limiter:
-            # Smooth openness when streaming video frames (had_prev is True)
-            if had_prev and self.smoothed_openness is not None:
+            # Constrains step-by-step increase when smoothed_openness is active
+            if self.smoothed_openness is not None:
                 max_openness = self.update_openness_rate_limit(raw_max_openness)
             else:
                 max_openness = raw_max_openness
@@ -709,15 +719,19 @@ class ZumaStateMachine:
             self._last_is_emergency = self.is_emergency
 
             # Fatal dying hole checks:
-            # 1. Collective full-chain suction: EMERGENCY state and >= 80% balls accelerating for >= 2 consecutive frames
+            # 1. Collective full-chain suction:
+            #    EMERGENCY state and >= 80% balls accelerating for >= 2 consecutive frames
             is_collective_fatal = (
                 self.is_emergency
                 and (self.fast_motion_consecutive_frames >= self.danger_config.collective_fast_consecutive_frames)
             )
             # 2. Physical swallowed ball fatal:
-            # In live stream (had_prev True): entered hole + frog lost ammunition
-            # In single static frame evaluation (had_prev False, e.g. test_15 Problem 1): verified ball in hole outside safe zone
-            is_ball_in_hole_fatal = has_ball_in_hole and (not frog_has_ball or not had_prev)
+            #    In streaming gameplay: EMERGENCY state + confirmed ball in hole + frog lost ammunition
+            #    In uninitialized static evaluation frame (test_15 Problem 1): confirmed ball in hole outside safe zone
+            is_ball_in_hole_fatal = has_ball_in_hole and (
+                (self.is_emergency and not frog_has_ball)
+                or (was_uninitialized and not had_prev)
+            )
 
             if is_collective_fatal or is_ball_in_hole_fatal:
                 self.is_emergency = True
@@ -729,12 +743,8 @@ class ZumaStateMachine:
                 return GameState.DYING_HOLE, info
 
             if self.is_emergency:
-                if not frog_has_ball:
-                    self.current_state = GameState.DYING_HOLE
-                    self._last_is_emergency = True
-                    info["max_openness"] = 1.0
-                    return GameState.DYING_HOLE, info
                 self.current_state = GameState.EMERGENCY
+                self._last_is_emergency = True
                 return GameState.EMERGENCY, info
 
         # 7. Default: IN_GAME
