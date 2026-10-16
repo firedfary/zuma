@@ -118,6 +118,7 @@ class ZumaGymEnv(gym.Env):
 
         # Wait for round ready composite gating (lives banner -> rush motion -> calm -> frog ready)
         self.state_machine.wait_for_round_ready(self.capture)
+        self.state_machine.reset()
 
         # Initial frame capture after settling and score reading
         time.sleep(0.05)
@@ -277,6 +278,8 @@ class ZumaGymEnv(gym.Env):
             "danger_str": f"Danger: {int(self.current_openness * 100)}%",
             "danger_penalty": danger_penalty,
             "hole_locations": self.hole_locations,
+            "fast_ball_ratio": state_info.get("fast_ball_ratio", 0.0),
+            "num_balls": state_info.get("num_balls", 0),
         }
 
         return obs, float(reward), terminated, truncated, info

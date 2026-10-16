@@ -625,5 +625,174 @@ class TestZumaRLSuite(unittest.TestCase):
 
         env.close()
 
+    def test_17_detect_all_balls(self):
+        """Test full-screen ball detection covering 6 colors and real gameplay images"""
+        sm = ZumaStateMachine(danger_config=self.config.danger)
+
+        # 1. Edge cases: empty/None frame
+        self.assertEqual(sm.detect_all_balls(None), [])
+        self.assertEqual(sm.detect_all_balls(np.zeros((0, 0, 3), dtype=np.uint8)), [])
+        self.assertEqual(sm.detect_all_balls(np.zeros((480, 640, 3), dtype=np.uint8)), [])
+
+        # 2. Synthetic frame with all 6 ball colors
+        canvas = np.zeros((480, 640, 3), dtype=np.uint8)
+        colors_rgb = [
+            (255, 0, 0),     # Red
+            (255, 255, 0),   # Yellow
+            (0, 255, 0),     # Green
+            (0, 0, 255),     # Blue
+            (200, 0, 200),   # Purple
+            (240, 240, 240), # White
+        ]
+        expected_locs = []
+        for i, col in enumerate(colors_rgb):
+            pt = (120 + i * 60, 220)
+            expected_locs.append(pt)
+            cv2.circle(canvas, pt, 15, col, -1)
+
+        detected = sm.detect_all_balls(canvas, is_bgr=False)
+        self.assertEqual(len(detected), 6, f"Expected 6 detected balls, got {len(detected)}: {detected}")
+        for exp in expected_locs:
+            matched = any(np.hypot(exp[0] - d[0], exp[1] - d[1]) <= 3 for d in detected)
+            self.assertTrue(matched, f"Ball at {exp} not found in {detected}")
+
+        # 3. Real user screenshots
+        user_p = r"C:/Users/fired/.gemini/antigravity/brain/fa5a9161-23ff-46ba-9697-6cec10ef368c/.user_uploaded"
+        p_fig1 = os.path.join(user_p, "media_1792076465643_559df118.jpg")
+        if os.path.exists(p_fig1):
+            raw = np.fromfile(p_fig1, dtype=np.uint8)
+            img = cv2.imdecode(raw, cv2.IMREAD_COLOR)
+            f640 = cv2.resize(img[39:39+720, 2:2+960], (640, 480))
+            rgb = cv2.cvtColor(f640, cv2.COLOR_BGR2RGB)
+            balls = sm.detect_all_balls(rgb, is_bgr=False)
+            self.assertGreaterEqual(len(balls), 40, f"Fig 1 should detect at least 40 balls, found {len(balls)}")
+
+    def test_18_collective_ball_motion_and_local_elimination(self):
+        """Test collective ball motion accurately distinguishes local elimination from fatal full-chain suction"""
+        sm = ZumaStateMachine(danger_config=self.config.danger)
+
+        # 1. Edge cases
+        self.assertEqual(sm.compute_collective_ball_motion(None, None, [], []), 0.0)
+
+        # Setup 10 baseline balls
+        f0 = np.zeros((480, 640, 3), dtype=np.uint8) + 60
+        balls0 = [(100 + i * 32, 200) for i in range(10)]
+        for b in balls0:
+            cv2.circle(f0, b, 14, (0, 0, 255), -1)
+
+        # 2. Stationary balls -> 0.0
+        r_stat = sm.compute_collective_ball_motion(f0, f0, balls0, balls0)
+        self.assertEqual(r_stat, 0.0)
+
+        # 3. Slow forward track progression (1 px shift) -> 0.0
+        f_slow = np.zeros((480, 640, 3), dtype=np.uint8) + 60
+        balls_slow = [(x + 1, y) for x, y in balls0]
+        for b in balls_slow:
+            cv2.circle(f_slow, b, 14, (0, 0, 255), -1)
+        r_slow = sm.compute_collective_ball_motion(f_slow, f0, balls_slow, balls0)
+        self.assertEqual(r_slow, 0.0)
+
+        # 4. Local elimination gap closure: 2 balls move backwards by 8 px, 8 balls stationary
+        f_local = np.zeros((480, 640, 3), dtype=np.uint8) + 60
+        balls_local = balls0[:8] + [(balls0[8][0] - 8, balls0[8][1]), (balls0[9][0] - 8, balls0[9][1])]
+        for b in balls_local:
+            cv2.circle(f_local, b, 14, (0, 0, 255), -1)
+        r_local = sm.compute_collective_ball_motion(f_local, f0, balls_local, balls0)
+        self.assertLess(r_local, self.config.danger.collective_fast_ball_ratio)
+        self.assertAlmostEqual(r_local, 0.20, places=2)
+
+        # 5. Full-chain acceleration (all 10 balls moving at high speed >= 10 px) -> 1.0 >= 0.80
+        f_fast = np.zeros((480, 640, 3), dtype=np.uint8) + 60
+        balls_fast = [(x + 10, y) for x, y in balls0]
+        for b in balls_fast:
+            cv2.circle(f_fast, b, 14, (0, 0, 255), -1)
+        r_fast = sm.compute_collective_ball_motion(f_fast, f0, balls_fast, balls0)
+        self.assertGreaterEqual(r_fast, self.config.danger.collective_fast_ball_ratio)
+        self.assertEqual(r_fast, 1.0)
+
+    def test_19_openness_rate_limiter_and_safe_gating(self):
+        """Test rate limiter suppresses instantaneous 0% -> 100% jumping and safe zone blocks flying bullets"""
+        sm = ZumaStateMachine(danger_config=self.config.danger)
+        sm.hole_locations = [(211, 216)]
+
+        # 1. Rate limiter clamp: instantaneous target spike of 1.0 from 0.0 is clamped by max_openness_step_delta (0.08)
+        sm.smoothed_openness = 0.0
+        val1 = sm.update_openness_rate_limit(1.0)
+        self.assertAlmostEqual(val1, 0.08, places=4)
+        val2 = sm.update_openness_rate_limit(1.0)
+        self.assertAlmostEqual(val2, 0.16, places=4)
+
+        # Monotonic multi-step progression takes at least 11 steps to reach EMERGENCY (>= 0.85)
+        for _ in range(9):
+            sm.update_openness_rate_limit(1.0)
+        self.assertGreaterEqual(sm.smoothed_openness, 0.85)
+
+        # 2. Replay user scenario (Step 31): Closed skull (0%), blue bullet flies over hole
+        sm.reset()
+        sm.hole_locations = [(211, 216)]
+
+        # Frame 0: Baseline closed skull
+        frame0 = np.zeros((480, 640, 3), dtype=np.uint8) + 120
+        # Closed golden teeth cavity (dark_ratio < 0.05)
+        frame0[216-20:216+20, 211-20:211+20] = [30, 180, 220]  # Golden teeth BGR
+        # Frog has loaded ball
+        frame0[233-10:233+10, 327-10:327+10] = [0, 220, 255]
+
+        state0, info0 = sm.detect_state(frame0)
+        self.assertEqual(state0, GameState.IN_GAME)
+        self.assertLess(info0["max_openness"], self.config.danger.safe_openness_threshold)
+
+        # Frame 1 (Step 31): Blue shot passing over closed skull
+        frame1 = frame0.copy()
+        frame1[216-10:216+10, 211-10:211+10] = [255, 0, 0]  # Blue bullet in BGR (RGB blue)
+
+        state1, info1 = sm.detect_state(frame1)
+        # MUST remain IN_GAME and must NOT jump to 100% or trigger DYING_HOLE!
+        self.assertEqual(state1, GameState.IN_GAME, "Flying bullet over closed skull must NOT trigger DYING_HOLE")
+        self.assertFalse(info1["has_ball_in_hole"], "Closed skull must shield has_ball_in_hole")
+        self.assertLessEqual(info1["max_openness"], 0.10, "Openness must not jump on closed skull")
+        self.assertFalse(sm.is_emergency)
+
+    def test_20_fatal_dying_hole_gating(self):
+        """Test refactored DYING_HOLE gating: requires EMERGENCY + collective acceleration (>= 2 frames) or swallowed ball"""
+        sm = ZumaStateMachine(danger_config=self.config.danger)
+        sm.hole_locations = [(200, 200)]
+        sm.is_emergency = True
+        sm.smoothed_openness = 0.90
+
+        # Create wide open black cavity
+        def make_frame(ball_offset=0, has_frog_ball=True):
+            f = np.zeros((480, 640, 3), dtype=np.uint8) + 50
+            # Open black cavity (dark_ratio > 0.80)
+            f[200-20:200+20, 200-20:200+20] = 5
+            # Frog ball
+            if has_frog_ball:
+                f[233-10:233+10, 327-10:327+10] = [0, 220, 255]
+            # Chain of 6 balls
+            for i in range(6):
+                cv2.circle(f, (300 + i * 32 + ball_offset, 300), 14, (0, 0, 255), -1)
+            return f
+
+        # Frame 1: Emergency, normal slow progression (offset 0 -> 1)
+        f_init = make_frame(ball_offset=0, has_frog_ball=True)
+        state, info = sm.detect_state(f_init)
+        self.assertEqual(state, GameState.EMERGENCY)
+
+        f_slow = make_frame(ball_offset=1, has_frog_ball=True)
+        state, info = sm.detect_state(f_slow)
+        self.assertEqual(state, GameState.EMERGENCY, "Slow movement must remain EMERGENCY")
+
+        # Frame 2: First frame of collective acceleration (offset +10) -> consecutive frames = 1 -> remains EMERGENCY
+        f_fast1 = make_frame(ball_offset=11, has_frog_ball=True)
+        state, info = sm.detect_state(f_fast1)
+        self.assertEqual(state, GameState.EMERGENCY, "1 frame of fast motion must not terminate immediately (needs 2)")
+        self.assertEqual(sm.fast_motion_consecutive_frames, 1)
+
+        # Frame 3: Second consecutive frame of collective acceleration (offset +21) -> consecutive frames = 2 -> DYING_HOLE!
+        f_fast2 = make_frame(ball_offset=21, has_frog_ball=True)
+        state, info = sm.detect_state(f_fast2)
+        self.assertEqual(state, GameState.DYING_HOLE, "2 consecutive fast motion frames in EMERGENCY must trigger DYING_HOLE")
+        self.assertEqual(info["max_openness"], 1.0)
+
 if __name__ == "__main__":
     unittest.main()

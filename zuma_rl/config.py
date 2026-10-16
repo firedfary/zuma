@@ -146,6 +146,25 @@ class DangerConfig:
     hole_match_relative_drop: float = 0.08
     # 关卡最大支持洞口数 (单轨 1, 双轨 2, 可扩展)
     max_holes: int = 2
+    # 骷髅张开物理速率限制：单步最大增量限制 (严禁瞬间跳变)
+    max_openness_step_delta: float = 0.08
+    # 骷髅张开安全期阈值 (低于此值强制屏蔽任何进球判定)
+    safe_openness_threshold: float = 0.30
+    # 全链集体加速判定球体占比阈值 (全屏 >= 80% 的球同时高速运动)
+    collective_fast_ball_ratio: float = 0.80
+    # 全链集体加速判定所需持续帧数
+    collective_fast_consecutive_frames: int = 2
+    # 单球高速运动位移阈值 (像素)
+    fast_ball_speed_threshold: float = 5.0
+    # 单球局部帧差高速运动阈值
+    fast_ball_diff_threshold: float = 12.0
+    # 球体连通域轮廓最小/最大面积 (球直径约 28~32 像素)
+    ball_min_area: int = 150
+    ball_max_area: int = 1600
+    # 球体圆度最小阈值
+    ball_min_circularity: float = 0.35
+    # 骷髅腔体开腔判定最小暗度比例 (低于此值视作物理闭合，严禁进球判定)
+    cavity_min_dark_ratio: float = 0.20
 
 @dataclass
 class StartGateConfig:
